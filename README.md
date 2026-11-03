@@ -6,8 +6,8 @@ It's like Wispr Flow, for Linux, with no account, no cloud and no subscription.
 
 - **Works everywhere.** It types through the system keyboard, so any app that accepts typing works.
 - **Fast and private.** It uses OpenAI's Whisper (large-v3-turbo) through [whisper.cpp](https://github.com/ggml-org/whisper.cpp) on your GPU (Vulkan) or CPU. Audio never leaves your machine.
-- **Many languages.** Whisper detects about 100 languages. There's also an optional Telugu mode with a dedicated Telugu model.
-- **Hands-free stop.** Speak, then pause for 2 seconds and it types. No second key press needed.
+- **English and Telugu, picked automatically.** With the optional Telugu model installed, Meta+Space tells Telugu from English by itself and writes Telugu in Telugu script. You can switch Auto to any of Whisper's ~100 languages.
+- **Hands-free stop.** Speak, then pause for 2 seconds and it types. No second key press needed. It starts transcribing as soon as you go quiet, so the text is usually ready when the pause ends.
 - **Live popup.** A small pill near the bottom of the screen shows your words as you speak, a level meter, and a countdown bar while you pause.
 - **Clean audio.** RNNoise removes background noise and hum, and speech detection drops clips with nothing said, so it doesn't type made-up words.
 - **Tray icon and history.** Pick the language, microphone and auto-stop time from the tray. Every dictation is saved locally, so you can search it, copy it, or type it again.
@@ -19,7 +19,7 @@ It's like Wispr Flow, for Linux, with no account, no cloud and no subscription.
 - **PipeWire** for audio.
 - **ydotool** for typing, and permission to use `/dev/uinput`. The installer tells you how to set this up if it's missing.
 - Rust (cargo). For GPU speed you also need `glslc` and the Vulkan headers.
-- About 600 MB of disk for the speech model, plus about 1 GB of GPU memory, or it runs on the CPU (slower).
+- About 600 MB of disk for the speech model, plus about 1 GB of GPU memory (about 1.7 GB with the Telugu model too), or it runs on the CPU (slower).
 
 ## Install
 
@@ -75,28 +75,36 @@ voicetype file [auto|en|te] clip.ogg …   # transcribe audio files
 
 Settings are saved in `~/.config/voicetype/settings.json`. History is saved in `~/.local/share/voicetype/history.jsonl`.
 
-## Telugu mode (optional)
+## Telugu (optional)
 
-Auto-detect often mistakes Telugu for English, so there's a separate mode that uses [vasista22/whisper-telugu-medium](https://huggingface.co/vasista22/whisper-telugu-medium). To set it up, convert that model once. This needs Python 3, git and about 6 GB of temporary space:
+Whisper's own language detection barely knows Telugu: it usually hears it as Hindi or English. VoiceType works around that with [vasista22/whisper-telugu-medium](https://huggingface.co/vasista22/whisper-telugu-medium), a Whisper model trained on Telugu. To set it up, convert and compress that model once. This needs Python 3, git, cmake and about 6 GB of temporary space:
 
 ```bash
 ./scripts/convert-telugu.sh
 ```
 
-Then use **Meta+Shift+Space**, or pick Telugu in the tray. The model is larger, so Telugu is noticeably slower than English for now.
+Once it's installed:
+
+- **Meta+Space (Auto)** sends speech to the Telugu model when it sounds like an Indian language or Whisper isn't sure it's English. Clear English stays on the fast English model.
+- **Meta+Shift+Space** always uses Telugu, which is handy for heavy Telugu–English mixing that Auto reads as English.
+
+On an RTX 3050 laptop, English takes about 0.5 s per clip and Telugu about 1–4 s. Telugu text breaks into far more pieces than English, so the model has more to write.
+
+To choose which languages Auto picks between, edit `"languages"` in `~/.config/voicetype/settings.json`. The default is `["en", "te"]`. For example, `["en", "hi"]` gives English and Hindi.
 
 ## Troubleshooting
 
 - **It types nonsense like "So", "The" or "Thank you", or nothing.** Your microphone is probably too loud or picking up hum. Run `wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 0.2`, or try another mic from the tray. The last clip is saved to `/run/user/$UID/voicetype-last.wav`, so you can listen to what it heard.
 - **Nothing gets typed.** Check that `ydotool type hello` works in a terminal. If it doesn't, ydotoold isn't running or you can't write to `/dev/uinput`. Re-run `./install.sh` and follow its instructions.
 - **Garbage output on a laptop with two GPUs.** VoiceType picks the discrete GPU automatically. To choose a GPU yourself, set `GGML_VK_VISIBLE_DEVICES=<n>` in the service. Device numbers are listed by `vulkaninfo --summary`.
+- **Suddenly slow (several seconds per clip) on a laptop GPU.** Run `nvidia-smi -q -d PERFORMANCE,POWER,CLOCK` while it transcribes. If the GPU sits in P5 with the memory clock far below its maximum, or reports an impossible power draw (hundreds of watts), the laptop's power controller has glitched and the driver is holding the GPU back. A normal reboot won't fix it. Do a cold boot: shut down, unplug the charger, hold the power button for 15–20 seconds, then boot. On one RTX 3050 laptop this took clips from 3.8 s to 0.65 s.
 - **Logs:** `journalctl --user -u voicetype -f` shows each clip's length, how long it took, and the text.
 
 ## How it works
 
 `voicetype daemon` runs as a user service. It holds the Whisper model in memory, draws the popup as a Wayland layer-shell surface (smithay-client-toolkit + tiny-skia + cosmic-text), shows the tray icon (StatusNotifierItem), and listens on a Unix socket for commands. Your shortcut runs `voicetype toggle`, which sends one line to that socket.
 
-Audio comes from `pw-record` at 48 kHz and goes through RNNoise (`nnnoiseless`). It is resampled to 16 kHz and trimmed using RNNoise's speech probability, then sent to whisper.cpp. Short live previews use greedy decoding while you speak. ASCII text is typed with `ydotool type`. Other scripts, such as Telugu, are pasted through the clipboard, and your previous clipboard is restored afterwards.
+Audio comes from `pw-record` at 48 kHz and goes through RNNoise (`nnnoiseless`). It is resampled to 16 kHz and trimmed using RNNoise's speech probability, then sent to whisper.cpp. Live previews use greedy decoding while you speak. When you go quiet, it transcribes the whole clip at full quality, and if you don't start talking again, that result is the one it types. ASCII text is typed with `ydotool type`. Other scripts, such as Telugu, are pasted through the clipboard, and your previous clipboard is restored afterwards.
 
 ## License
 

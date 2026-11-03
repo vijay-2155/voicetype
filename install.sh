@@ -2,6 +2,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+export PATH="$HOME/.cargo/bin:$PATH"
 
 FEATURES="--features vulkan"
 GET_MODEL=1

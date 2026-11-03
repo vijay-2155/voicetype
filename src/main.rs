@@ -36,11 +36,14 @@ fn sock_path() -> PathBuf {
     runtime_dir().join("voicetype.sock")
 }
 
+type Spec = Arc<Mutex<Option<(usize, String)>>>;
+
 struct Session {
     id: u64,
     rec: Recorder,
     profile: Profile,
     stop: Arc<AtomicBool>,
+    spec: Spec,
 }
 
 struct Ctl {
@@ -166,12 +169,41 @@ impl Ctl {
             let (vad, ui, flag, wait) = (rec.vad.clone(), self.ui.clone(), stop.clone(), self.settings.auto_stop);
             std::thread::spawn(move || watch_pause(id, wait, &vad, &ui, &flag));
         }
+        let spec: Spec = Arc::new(Mutex::new(None));
         let flag = stop.clone();
+        let spec_w = spec.clone();
         std::thread::spawn(move || {
             let mut last = 0;
+            let mut last_run = Instant::now() - Duration::from_secs(1);
             while !flag.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(500));
-                if !audio::heard_speech(&vad.lock().unwrap()) {
+                std::thread::sleep(Duration::from_millis(100));
+                let (heard, quiet, vlen) = {
+                    let v = vad.lock().unwrap();
+                    (audio::heard_speech(&v), audio::trailing_silence(&v), v.len())
+                };
+                if !heard {
+                    continue;
+                }
+                if quiet >= SPEC_AFTER {
+                    let fresh = spec_w.lock().unwrap().as_ref().is_none_or(|(l, _)| *l < vlen.saturating_sub((quiet * 100.0) as usize));
+                    if !fresh {
+                        continue;
+                    }
+                    let (clip, l) = {
+                        let s = samples.lock().unwrap();
+                        let v = vad.lock().unwrap();
+                        (audio::finish_clip(&s, &v), v.len())
+                    };
+                    let mut eng = engine.lock().unwrap();
+                    if let Ok(text) = eng.transcribe(profile, &clip, false, None) {
+                        if !flag.load(Ordering::SeqCst) && !text.is_empty() {
+                            let _ = ui.send(UiMsg::Partial(text.clone()));
+                        }
+                        *spec_w.lock().unwrap() = Some((l, text));
+                    }
+                    continue;
+                }
+                if last_run.elapsed() < Duration::from_millis(500) {
                     continue;
                 }
                 let snap = {
@@ -183,17 +215,15 @@ impl Ctl {
                     s[s.len().saturating_sub(RATE * 25)..].to_vec()
                 };
                 let Ok(mut eng) = engine.try_lock() else { continue };
-                if flag.load(Ordering::SeqCst) {
-                    break;
-                }
-                if let Ok(text) = eng.transcribe(profile, &snap, true) {
+                last_run = Instant::now();
+                if let Ok(text) = eng.transcribe(profile, &snap, true, Some(&flag)) {
                     if !flag.load(Ordering::SeqCst) && !text.is_empty() {
                         let _ = ui.send(UiMsg::Partial(text));
                     }
                 }
             }
         });
-        self.session = Some(Session { id, rec, profile, stop });
+        self.session = Some(Session { id, rec, profile, stop, spec });
         set_tray(&self.tray, |t| t.state = State::Recording(profile));
         eprintln!("recording [{}]", profile.label());
         Ok(())
@@ -210,10 +240,22 @@ impl Ctl {
         let ui = self.ui.clone();
         let busy = self.busy.clone();
         std::thread::spawn(move || {
-            let audio = s.rec.stop();
-            let _ = audio::write_wav(&runtime_dir().join("voicetype-last.wav"), &audio);
             let t = Instant::now();
-            let result = if audio.is_empty() { Ok(String::new()) } else { engine.lock().unwrap().transcribe(s.profile, &audio, false) };
+            let (audio, vad) = s.rec.stop();
+            let _ = audio::write_wav(&runtime_dir().join("voicetype-last.wav"), &audio);
+            let result = if audio.is_empty() {
+                Ok(String::new())
+            } else {
+                let mut eng = engine.lock().unwrap();
+                let early = s.spec.lock().unwrap().take().filter(|(l, _)| !audio::speech_after(&vad, *l));
+                match early {
+                    Some((_, text)) => {
+                        eprintln!("used the transcript made during the pause");
+                        Ok(text)
+                    }
+                    None => eng.transcribe(s.profile, &audio, false, None),
+                }
+            };
             match result {
                 Ok(text) if !text.is_empty() => {
                     eprintln!("{:.1}s audio -> {:.2}s: {text}", audio.len() as f32 / RATE as f32, t.elapsed().as_secs_f32());
@@ -243,6 +285,7 @@ impl Ctl {
 }
 
 const GRACE: f32 = 0.5;
+const SPEC_AFTER: f32 = 0.35;
 const NO_SPEECH_LIMIT: Duration = Duration::from_secs(10);
 
 fn watch_pause(id: u64, wait: f32, vad: &Mutex<Vec<f32>>, ui: &channel::Sender<UiMsg>, flag: &AtomicBool) {
@@ -277,12 +320,21 @@ fn watch_pause(id: u64, wait: f32, vad: &Mutex<Vec<f32>>, ui: &channel::Sender<U
 }
 
 fn daemon() -> Result<()> {
-    let engine = Arc::new(Mutex::new(Engine::new()));
+    let engine = Arc::new(Mutex::new({
+        let mut e = Engine::new();
+        e.auto_languages = history::Settings::load().languages;
+        e
+    }));
     {
         let engine = engine.clone();
         std::thread::spawn(move || {
             if let Err(e) = engine.lock().unwrap().preload(Profile::Auto) {
                 eprintln!("preload failed: {e:#}");
+            }
+            if engine.lock().unwrap().auto_languages.iter().any(|l| l == "te") {
+                if let Err(e) = engine.lock().unwrap().preload(Profile::Te) {
+                    eprintln!("telugu preload skipped: {e:#}");
+                }
             }
         });
     }
@@ -361,10 +413,11 @@ fn files(args: &[String]) -> Result<()> {
         None => (Profile::Auto, args),
     };
     let mut engine = Engine::new();
+    engine.auto_languages = history::Settings::load().languages;
     for f in rest {
         let audio = audio::decode_file(f, std::env::var_os("VOICETYPE_RAW").is_none())?;
         let t = Instant::now();
-        let text = engine.transcribe(profile, &audio, false)?;
+        let text = engine.transcribe(profile, &audio, false, None)?;
         eprintln!("-- {f} ({:.1}s audio, {:.2}s)", audio.len() as f32 / RATE as f32, t.elapsed().as_secs_f32());
         println!("{text}");
     }

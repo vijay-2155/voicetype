@@ -22,4 +22,8 @@ EOF
 mkdir -p out
 python whisper.cpp/models/convert-h5-to-ggml.py telugu whisper out
 mv out/ggml-model.bin "$MODELS/ggml-telugu-medium.bin"
-echo "Saved $MODELS/ggml-telugu-medium.bin. Telugu mode (Meta+Shift+Space) is ready."
+
+cmake -S whisper.cpp -B whisper.cpp/build -DCMAKE_BUILD_TYPE=Release >/dev/null
+cmake --build whisper.cpp/build -j --target whisper-quantize >/dev/null
+whisper.cpp/build/bin/whisper-quantize "$MODELS/ggml-telugu-medium.bin" "$MODELS/ggml-telugu-medium-q5_0.bin" q5_0
+echo "Saved $MODELS/ggml-telugu-medium-q5_0.bin. Telugu works in Auto mode and on Meta+Shift+Space."

@@ -65,6 +65,10 @@ pub fn heard_speech(vad: &[f32]) -> bool {
     vad.iter().filter(|&&p| p > SPEECH).count() >= 12
 }
 
+pub fn speech_after(vad: &[f32], from: usize) -> bool {
+    vad.get(from..).is_some_and(|v| v.iter().any(|&p| p > SPEECH))
+}
+
 pub fn trailing_silence(vad: &[f32]) -> f32 {
     let quiet = vad.iter().rev().take_while(|&&p| p <= SPEECH).count();
     quiet as f32 * FRAME as f32 / MIC_RATE as f32
@@ -147,7 +151,7 @@ impl Recorder {
         Ok(Self { child, reader: Some(reader), samples, vad })
     }
 
-    pub fn stop(mut self) -> Vec<f32> {
+    pub fn stop(mut self) -> (Vec<f32>, Vec<f32>) {
         std::thread::sleep(Duration::from_millis(150));
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -156,7 +160,7 @@ impl Recorder {
         }
         let audio = std::mem::take(&mut *self.samples.lock().unwrap());
         let vad = std::mem::take(&mut *self.vad.lock().unwrap());
-        finish_clip(&audio, &vad)
+        (finish_clip(&audio, &vad), vad)
     }
 
     pub fn cancel(mut self) {

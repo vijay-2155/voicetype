@@ -59,6 +59,7 @@ pub struct Settings {
     pub profile: String,
     pub mic: Option<String>,
     pub auto_stop: f32,
+    pub languages: Vec<String>,
 }
 
 impl Settings {
@@ -68,6 +69,11 @@ impl Settings {
             profile: v["profile"].as_str().unwrap_or("auto").to_string(),
             mic: v["mic"].as_str().map(str::to_string),
             auto_stop: v["auto_stop"].as_f64().unwrap_or(2.0) as f32,
+            languages: v["languages"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_string)).collect::<Vec<_>>())
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| vec!["en".into(), "te".into()]),
         }
     }
 
@@ -76,7 +82,7 @@ impl Settings {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(p, json!({"profile": self.profile, "mic": self.mic, "auto_stop": self.auto_stop}).to_string());
+        let _ = std::fs::write(p, json!({"profile": self.profile, "mic": self.mic, "auto_stop": self.auto_stop, "languages": self.languages}).to_string());
     }
 }
 

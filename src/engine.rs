@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -34,6 +36,7 @@ impl Profile {
 
     fn model_file(self) -> &'static str {
         match self {
+            Self::Te if model_dir().join("ggml-telugu-medium-q5_0.bin").exists() => "ggml-telugu-medium-q5_0.bin",
             Self::Te => "ggml-telugu-medium.bin",
             _ => "ggml-large-v3-turbo-q5_0.bin",
         }
@@ -55,6 +58,8 @@ impl Profile {
     }
 }
 
+const INDIC: [&str; 12] = ["hi", "te", "ta", "kn", "ml", "mr", "bn", "gu", "pa", "ur", "sa", "ne"];
+
 pub fn model_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("VOICETYPE_MODELS") {
         return PathBuf::from(dir);
@@ -68,6 +73,7 @@ pub fn model_dir() -> PathBuf {
 pub struct Engine {
     states: HashMap<&'static str, WhisperState>,
     threads: i32,
+    pub auto_languages: Vec<String>,
 }
 
 impl Engine {
@@ -77,7 +83,7 @@ impl Engine {
             whisper_rs::install_logging_hooks();
         }
         let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8)) as i32;
-        Self { states: HashMap::new(), threads }
+        Self { states: HashMap::new(), threads, auto_languages: vec!["en".into(), "te".into()] }
     }
 
     pub fn preload(&mut self, profile: Profile) -> Result<()> {
@@ -103,7 +109,50 @@ impl Engine {
         Ok(self.states.get_mut(file).unwrap())
     }
 
-    pub fn transcribe(&mut self, profile: Profile, audio: &[f32], fast: bool) -> Result<String> {
+    fn pick_language(&mut self, audio: &[f32]) -> Result<String> {
+        if self.auto_languages.len() == 1 {
+            return Ok(self.auto_languages[0].clone());
+        }
+        let threads = self.threads as usize;
+        let mut clip = audio[..audio.len().min(RATE * 30)].to_vec();
+        clip.resize(clip.len().max(RATE + RATE / 10), 0.0);
+        let state = self.state(Profile::Auto)?;
+        state.pcm_to_mel(&clip, threads).context("mel")?;
+        let (_, probs) = state.lang_detect(0, threads).context("language detection")?;
+        let score = |l: &str| whisper_rs::get_lang_id(l).and_then(|i| probs.get(i as usize).copied()).unwrap_or(0.0);
+        let top = (0..probs.len()).max_by(|a, b| probs[*a].total_cmp(&probs[*b])).and_then(|i| whisper_rs::get_lang_str(i as i32)).unwrap_or("en");
+        let allowed = |l: &str| self.auto_languages.iter().any(|a| a == l);
+        let indic: f32 = INDIC.iter().map(|l| score(l)).sum();
+        let te = allowed("te") && model_dir().join(Profile::Te.model_file()).exists();
+        let best = if te && top != "te" && (indic >= 0.05 || (top == "en" && score("en") < 0.85)) {
+            "te".to_string()
+        } else if allowed(top) && top != "te" {
+            top.to_string()
+        } else if te && INDIC.contains(&top) {
+            "te".to_string()
+        } else {
+            self.auto_languages.iter().filter(|l| te || *l != "te").max_by(|a, b| score(a).total_cmp(&score(b))).cloned().unwrap_or_else(|| "en".into())
+        };
+        if std::env::var_os("VOICETYPE_DEBUG").is_some() {
+            let all: Vec<String> = self.auto_languages.iter().map(|l| format!("{l}={:.2}", score(l))).collect();
+            let mut ids: Vec<usize> = (0..probs.len()).collect();
+            ids.sort_by(|a, b| probs[*b].total_cmp(&probs[*a]));
+            let top5: Vec<String> = ids.iter().take(6).map(|&i| format!("{}={:.2}", whisper_rs::get_lang_str(i as i32).unwrap_or("?"), probs[i])).collect();
+            eprintln!("language: {best} (top: {}; {})", top5.join(" "), all.join(" "));
+        }
+        Ok(best)
+    }
+
+    pub fn transcribe(&mut self, profile: Profile, audio: &[f32], fast: bool, abort: Option<&Arc<AtomicBool>>) -> Result<String> {
+        if profile != Profile::Auto {
+            return self.run(profile, profile.name(), audio, fast, abort);
+        }
+        let lang = self.pick_language(audio)?;
+        let model = if lang == "te" { Profile::Te } else { Profile::Auto };
+        self.run(model, &lang, audio, fast, abort)
+    }
+
+    fn run(&mut self, profile: Profile, lang: &str, audio: &[f32], fast: bool, abort: Option<&Arc<AtomicBool>>) -> Result<String> {
         let threads = self.threads;
         let pieces = match profile.chunk_secs() {
             Some(secs) => split_on_silence(audio, secs * RATE),
@@ -121,7 +170,7 @@ impl Engine {
                 SamplingStrategy::BeamSearch { beam_size: 5, patience: -1.0 }
             };
             let mut p = FullParams::new(strategy);
-            p.set_language(Some(profile.name()));
+            p.set_language(Some(lang));
             p.set_n_threads(threads);
             p.set_no_context(true);
             p.set_no_timestamps(true);
@@ -131,6 +180,13 @@ impl Engine {
             p.set_print_progress(false);
             p.set_print_realtime(false);
             p.set_print_timestamps(false);
+            if profile == Profile::Te {
+                p.set_temperature_inc(0.0);
+            }
+            if let Some(flag) = abort {
+                let flag = flag.clone();
+                p.set_abort_callback_safe(move || flag.load(Ordering::SeqCst));
+            }
             let mut padded;
             let data = if piece.len() < RATE + RATE / 10 {
                 padded = piece.to_vec();
@@ -139,6 +195,9 @@ impl Engine {
             } else {
                 piece
             };
+            if abort.is_some_and(|f| f.load(Ordering::SeqCst)) {
+                bail!("aborted");
+            }
             state.full(p, data).context("whisper run")?;
             for seg in state.as_iter() {
                 let text = seg.to_str_lossy().map(|s| s.trim().to_string()).unwrap_or_default();
