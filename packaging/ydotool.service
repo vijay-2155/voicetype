@@ -1,0 +1,12 @@
+[Unit]
+Description=ydotool daemon for VoiceType
+
+[Service]
+Type=simple
+Restart=always
+ExecStart=/usr/bin/ydotoold
+ExecReload=/usr/bin/kill -HUP $MAINPID
+KillMode=process
+
+[Install]
+WantedBy=default.target

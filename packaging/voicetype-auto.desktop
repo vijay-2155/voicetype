@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Voice typing
+Comment=Start or stop dictation
+Exec=@BIN@ toggle
+Icon=audio-input-microphone
+NoDisplay=true
+X-KDE-Shortcuts=Meta+Space

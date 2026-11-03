@@ -1,0 +1,12 @@
+[Unit]
+Description=VoiceType local voice typing
+After=graphical-session.target ydotool.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/voicetype daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

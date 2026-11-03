@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Voice typing history
+Comment=Past dictations: search, copy or type again
+Exec=@BIN@ history
+Icon=view-history
+Categories=Utility;
+StartupWMClass=voicetype-history

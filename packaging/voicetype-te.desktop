@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Voice typing (Telugu)
+Comment=Start or stop Telugu dictation
+Exec=@BIN@ toggle te
+Icon=audio-input-microphone
+NoDisplay=true
+X-KDE-Shortcuts=Meta+Shift+Space
