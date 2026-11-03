@@ -10,6 +10,7 @@ It's like Wispr Flow, for Linux, with no account, no cloud and no subscription.
 - **Hands-free stop.** Speak, then pause for 2 seconds and it types. No second key press needed. It starts transcribing as soon as you go quiet, so the text is usually ready when the pause ends.
 - **Live popup.** A small pill near the bottom of the screen shows your words as you speak, a level meter, and a countdown bar while you pause.
 - **Clean audio.** RNNoise removes background noise and hum, and speech detection drops clips with nothing said, so it doesn't type made-up words.
+- **Your names, spelled right.** Add names and brands (Claude, Anthropic, your colleagues) to a words list and Whisper uses them as a spelling hint. Fix-up rules catch anything it still gets wrong.
 - **Tray icon and history.** Pick the language, microphone and auto-stop time from the tray. Every dictation is saved locally, so you can search it, copy it, or type it again.
 - **Light.** One Rust binary. The background service uses about 155 MB of RAM plus the model in GPU memory.
 
@@ -58,7 +59,7 @@ To uninstall, run `./uninstall.sh`. Add `--purge` to also delete the models, his
 2. Press **Meta+Space** and speak.
 3. Pause for 2 seconds. It transcribes and types. You can press Meta+Space again to stop early.
 
-**Tray menu:** start or stop dictation, language (Auto / English / Telugu), microphone, auto-stop after pause (Off, 1, 1.5, 2 or 3 seconds), your last 10 dictations (click to copy), *Type last again*, and *History…*.
+**Tray menu:** start or stop dictation, language (Auto / English / Telugu), microphone, auto-stop after pause (Off, 1, 1.5, 2 or 3 seconds), your last 10 dictations (click to copy), *Type last again*, *Edit words and names…*, and *History…*.
 
 **Commands:**
 
@@ -74,6 +75,28 @@ voicetype file [auto|en|te] clip.ogg …   # transcribe audio files
 ```
 
 Settings are saved in `~/.config/voicetype/settings.json`. History is saved in `~/.local/share/voicetype/history.jsonl`.
+
+## Names and words
+
+Whisper doesn't know your colleagues' names or newer brand names, so "Claude Code" can come out as "Cloud Code". Open **Edit words and names…** from the tray (the file is `~/.config/voicetype/words.txt`) and add one name per line:
+
+```
+Claude Code
+Anthropic
+PlotDial
+Manibarshit
+```
+
+The list goes to Whisper as a spelling hint with each dictation. Changes apply to your next dictation, with no restart needed.
+
+If a word still comes out wrong, add a fix rule. It replaces whole words, ignoring upper and lower case:
+
+```
+cloud code => Claude Code
+mani barshit => Manibarshit
+```
+
+The live preview skips the hint to stay fast, so a name can look wrong while you speak and then come out right in the typed text. The Telugu model doesn't use the hint either, but fix rules still apply to Telugu.
 
 ## Telugu (optional)
 

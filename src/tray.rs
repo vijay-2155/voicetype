@@ -200,6 +200,17 @@ impl ksni::Tray for VoiceTray {
             }
             .into(),
             StandardItem {
+                label: "Edit words and names…".into(),
+                icon_name: "document-edit".into(),
+                activate: Box::new(|_| {
+                    if let Ok(mut child) = std::process::Command::new("xdg-open").arg(crate::history::words_file()).spawn() {
+                        std::thread::spawn(move || child.wait());
+                    }
+                }),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
                 label: "History…".into(),
                 icon_name: "view-history".into(),
                 activate: Box::new(|_| {

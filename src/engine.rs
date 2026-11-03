@@ -144,15 +144,19 @@ impl Engine {
     }
 
     pub fn transcribe(&mut self, profile: Profile, audio: &[f32], fast: bool, abort: Option<&Arc<AtomicBool>>) -> Result<String> {
-        if profile != Profile::Auto {
-            return self.run(profile, profile.name(), audio, fast, abort);
-        }
-        let lang = self.pick_language(audio)?;
-        let model = if lang == "te" { Profile::Te } else { Profile::Auto };
-        self.run(model, &lang, audio, fast, abort)
+        let words = crate::history::words();
+        let (model, lang) = if profile == Profile::Auto {
+            let lang = self.pick_language(audio)?;
+            (if lang == "te" { Profile::Te } else { Profile::Auto }, lang)
+        } else {
+            (profile, profile.name().to_string())
+        };
+        let prompt = if fast || model == Profile::Te { None } else { words.prompt.as_deref() };
+        let text = self.run(model, &lang, audio, fast, abort, prompt)?;
+        Ok(crate::history::apply_fixes(&text, &words.fixes))
     }
 
-    fn run(&mut self, profile: Profile, lang: &str, audio: &[f32], fast: bool, abort: Option<&Arc<AtomicBool>>) -> Result<String> {
+    fn run(&mut self, profile: Profile, lang: &str, audio: &[f32], fast: bool, abort: Option<&Arc<AtomicBool>>, prompt: Option<&str>) -> Result<String> {
         let threads = self.threads;
         let pieces = match profile.chunk_secs() {
             Some(secs) => split_on_silence(audio, secs * RATE),
@@ -182,6 +186,9 @@ impl Engine {
             p.set_print_timestamps(false);
             if profile == Profile::Te {
                 p.set_temperature_inc(0.0);
+            }
+            if let Some(prompt) = prompt {
+                p.set_initial_prompt(prompt);
             }
             if let Some(flag) = abort {
                 let flag = flag.clone();

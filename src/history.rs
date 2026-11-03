@@ -86,6 +86,85 @@ impl Settings {
     }
 }
 
+const DEFAULT_WORDS: &str = "# Names and words VoiceType should spell your way, one per line.
+# Whisper gets this list as a hint, so it writes \"Claude\" instead of \"cloud\".
+#
+# If a word still comes out wrong, add a fix:  what it writes => what you want
+# Example:  cloud code => Claude Code
+
+Claude
+Claude Code
+Anthropic
+Codex
+ChatGPT
+GitHub
+WhatsApp
+PlotDial
+VoiceType
+Telugu
+Tenglish
+Rajesh
+Vijay
+Rust
+Kotlin
+Supabase
+";
+
+pub fn words_file() -> PathBuf {
+    let p = settings_path().with_file_name("words.txt");
+    if !p.exists() {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&p, DEFAULT_WORDS);
+    }
+    p
+}
+
+#[derive(Default)]
+pub struct Words {
+    pub prompt: Option<String>,
+    pub fixes: Vec<(String, String)>,
+}
+
+pub fn words() -> Words {
+    let raw = std::fs::read_to_string(words_file()).unwrap_or_default();
+    let mut names = Vec::new();
+    let mut fixes = Vec::new();
+    for line in raw.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        match line.split_once("=>") {
+            Some((from, to)) if !from.trim().is_empty() => fixes.push((from.trim().to_lowercase(), to.trim().to_string())),
+            _ => names.push(line.to_string()),
+        }
+    }
+    names.truncate(80);
+    Words { prompt: (!names.is_empty()).then(|| format!("{}.", names.join(", "))), fixes }
+}
+
+pub fn apply_fixes(text: &str, fixes: &[(String, String)]) -> String {
+    let mut out = text.to_string();
+    for (from, to) in fixes {
+        let mut i = 0;
+        loop {
+            let lower = out.to_lowercase();
+            if lower.len() != out.len() {
+                break;
+            }
+            let Some(pos) = lower[i..].find(from.as_str()).map(|p| p + i) else { break };
+            let end = pos + from.len();
+            let before = out[..pos].chars().next_back().is_some_and(char::is_alphanumeric);
+            let after = out[end..].chars().next().is_some_and(char::is_alphanumeric);
+            if before || after {
+                i = end;
+                continue;
+            }
+            out.replace_range(pos..end, to);
+            i = pos + to.len();
+        }
+    }
+    out
+}
+
 pub fn copy(text: &str) {
     let _ = Command::new("wl-copy").arg("--").arg(text).status();
 }
