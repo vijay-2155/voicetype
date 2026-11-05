@@ -21,7 +21,7 @@ It's like Wispr Flow, for Linux, with no account, no cloud and no subscription.
 - **PipeWire** for audio.
 - **ydotool** for typing, and permission to use `/dev/uinput`. The installer tells you how to set this up if it's missing.
 - Rust (cargo). For GPU speed you also need `glslc` and the Vulkan headers.
-- Optional, for text cleanup: [Ollama](https://ollama.com) and about 2.3 GB more GPU memory.
+- Optional, for text cleanup: [Ollama](https://ollama.com) and about 3 GB more GPU memory while dictating.
 - About 600 MB of disk for the speech model, plus about 1 GB of GPU memory, or it runs on the CPU (slower).
 
 ## Install
@@ -113,7 +113,7 @@ VoiceType can pass each dictation through a small local model, Qwen 3.5 2B. Pick
 - **Grammar** makes light fixes. Use it for messages to people.
 - **Prompt** fixes grammar, removes restarts and rewrites your speech as clear sentences. Use it when talking to AI tools.
 
-It needs [Ollama](https://ollama.com) running on this computer and about 2.3 GB more GPU memory:
+It needs [Ollama](https://ollama.com) running on this computer:
 
 ```bash
 ollama pull qwen3.5:2b
@@ -121,6 +121,8 @@ voicetype cleanup prompt
 ```
 
 Text stays on your computer, and a typical clip takes about 0.3 s more on a laptop RTX 3050.
+
+The model uses about 3 GB of GPU memory, but only around dictation. It starts loading when you press the shortcut, so the 2–4 s load usually finishes while you speak. It unloads 5 minutes after your last dictation, or straight away when you switch cleanup to Off. If less than 3.5 GB is free when you start, because a game or another app is using the GPU, VoiceType leaves that memory alone and types your original words for that clip.
 
 The model is small and sometimes changes what you meant. In a test on 57 real dictations, Grammar changed the meaning or invented details in about 1 clip in 11, and Prompt in about 1 clip in 7. Most Prompt mistakes were on clips that were already garbled or cut off. Grammar removed about half of the "I mean" corrections; Prompt removed nearly all of them. VoiceType never presses Enter, so read the text before you send it.
 

@@ -118,9 +118,8 @@ impl Ctl {
                     self.settings.cleanup = mode;
                     self.settings.save();
                     set_tray(&self.tray, |t| t.cleanup = mode);
-                    if mode != cleanup::Mode::Off {
-                        std::thread::spawn(cleanup::warm);
-                    }
+                    let job: fn() = if mode == cleanup::Mode::Off { cleanup::unload } else { cleanup::warm };
+                    std::thread::spawn(job);
                     format!("cleanup {}", mode.name())
                 }
                 None => "usage: cleanup off|grammar|prompt".into(),
