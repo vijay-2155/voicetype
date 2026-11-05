@@ -65,6 +65,7 @@ if ((GET_MODEL)); then
 fi
 
 mkdir -p "$APPS" "$UNITS"
+rm -f "$APPS/voicetype-te.desktop"  # left by older versions
 for f in packaging/*.desktop; do
     sed "s|@BIN@|$BIN|" "$f" > "$APPS/$(basename "$f")"
 done
@@ -91,9 +92,9 @@ systemctl --user restart voicetype.service
 
 if [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]] && command -v kwriteconfig6 >/dev/null; then
     kwriteconfig6 --file kglobalshortcutsrc --group services --group voicetype-auto.desktop --key _launch "Meta+Space"
-    kwriteconfig6 --file kglobalshortcutsrc --group services --group voicetype-te.desktop --key _launch "Meta+Shift+Space"
+    kwriteconfig6 --file kglobalshortcutsrc --group services --group voicetype-te.desktop --key _launch --delete
     command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 >/dev/null 2>&1 || true
-    say "Shortcuts set: Meta+Space (dictate), Meta+Shift+Space (Telugu). Log out and in if they don't respond yet."
+    say "Shortcut set: Meta+Space (dictate). Log out and in if they don't respond yet."
 else
     say "Bind a keyboard shortcut in your desktop settings to:  $BIN toggle"
 fi

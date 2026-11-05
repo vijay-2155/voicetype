@@ -27,10 +27,9 @@ use wayland_client::{
 };
 
 pub enum UiMsg {
-    Listening(&'static str),
-    Level(f32),
+    Listening,
+    Level(crate::audio::InputLevel),
     Pause(f32),
-    Partial(String),
     Transcribing,
     Done(String),
     Error(String),
@@ -45,18 +44,34 @@ enum Mode {
     Error,
 }
 
+fn display_content(mode: Mode, text: &str) -> (&str, bool) {
+    match mode {
+        Mode::Listening | Mode::Transcribing => ("", true),
+        Mode::Done | Mode::Error => (text, false),
+    }
+}
+
 const W: u32 = 640;
 const BASE_H: u32 = 60;
 const LINE_H: f32 = 24.0;
 const MAX_LINES: usize = 3;
 const BOTTOM: i32 = 110;
 const TEXT_X: f32 = 74.0;
-const TEXT_RIGHT: f32 = 96.0;
+const TEXT_RIGHT: f32 = 24.0;
+
+fn overlay_size(mode: Mode, lines: usize) -> (u32, u32) {
+    match mode {
+        Mode::Listening | Mode::Transcribing => (96, 40),
+        Mode::Done | Mode::Error => (W, BASE_H + (lines.max(1) as u32 - 1) * LINE_H as u32),
+    }
+}
 
 struct Surf {
     layer: LayerSurface,
     pool: SlotPool,
+    w: u32,
     h: u32,
+    want_w: u32,
     want_h: u32,
     scale: i32,
     configured: bool,
@@ -72,7 +87,6 @@ struct Ui {
     qh: QueueHandle<Ui>,
     surf: Option<Surf>,
     mode: Mode,
-    label: &'static str,
     text: String,
     levels: VecDeque<f32>,
     pause: f32,
@@ -109,7 +123,6 @@ pub fn run(rx: channel::Channel<UiMsg>) -> Result<()> {
         qh,
         surf: None,
         mode: Mode::Listening,
-        label: "",
         text: String::new(),
         levels: VecDeque::from(vec![0.0; 24]),
         pause: 0.0,
@@ -131,9 +144,8 @@ pub fn run(rx: channel::Channel<UiMsg>) -> Result<()> {
 impl Ui {
     fn handle(&mut self, m: UiMsg) {
         match m {
-            UiMsg::Listening(label) => {
+            UiMsg::Listening => {
                 self.mode = Mode::Listening;
-                self.label = label;
                 self.text.clear();
                 self.levels.iter_mut().for_each(|l| *l = 0.0);
                 self.pause = 0.0;
@@ -142,16 +154,14 @@ impl Ui {
                 self.show();
             }
             UiMsg::Level(l) => {
-                let v = (l * 9.0).sqrt().min(1.0);
+                let v = (l.rms * 9.0).sqrt().min(1.0);
+                if std::env::var_os("VOICETYPE_DEBUG").is_some() {
+                    eprintln!("{}", l.description());
+                }
                 self.levels.pop_front();
                 self.levels.push_back(v);
             }
             UiMsg::Pause(p) => self.pause = p,
-            UiMsg::Partial(t) => {
-                if self.mode == Mode::Listening {
-                    self.text = t;
-                }
-            }
             UiMsg::Transcribing => {
                 self.mode = Mode::Transcribing;
                 self.pause = 0.0;
@@ -185,13 +195,14 @@ impl Ui {
         layer.set_anchor(Anchor::BOTTOM);
         layer.set_margin(0, 0, BOTTOM, 0);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        layer.set_size(W, BASE_H);
+        let (w, h) = overlay_size(self.mode, 1);
+        layer.set_size(w, h);
         layer.commit();
         let pool = match SlotPool::new((W * BASE_H * 4 * 4) as usize, &self.shm) {
             Ok(p) => p,
             Err(_) => return,
         };
-        self.surf = Some(Surf { layer, pool, h: BASE_H, want_h: BASE_H, scale: 1, configured: false, frame_pending: false });
+        self.surf = Some(Surf { layer, pool, w, h, want_w: w, want_h: h, scale: 1, configured: false, frame_pending: false });
     }
 
     fn tick(&mut self) {
@@ -212,12 +223,7 @@ impl Ui {
     }
 
     fn display_text(&mut self, width: f32, scale: f32) -> (Buffer, usize, bool) {
-        let (body, placeholder) = match (self.mode, self.text.is_empty()) {
-            (Mode::Listening, true) if self.pause > 0.0 => ("Sending soon — keep talking to continue".to_string(), true),
-            (Mode::Listening, true) => ("Listening…".to_string(), true),
-            (Mode::Transcribing, true) => ("Transcribing…".to_string(), true),
-            _ => (self.text.clone(), false),
-        };
+        let (body, placeholder) = display_content(self.mode, &self.text);
         let mut words: Vec<&str> = body.split_whitespace().collect();
         let metrics = Metrics::new(17.0 * scale, LINE_H * scale);
         let attrs = Attrs::new().family(Family::Name("Inter")).weight(Weight(if placeholder { 400 } else { 500 }));
@@ -246,16 +252,19 @@ impl Ui {
         let sf = scale as f32;
         let text_w = W as f32 - TEXT_X - TEXT_RIGHT;
         let (mut buf, lines, placeholder) = self.display_text(text_w, sf);
-        let want_h = BASE_H + (lines as u32 - 1) * LINE_H as u32;
+        let (want_w, want_h) = overlay_size(self.mode, lines);
 
         let surf = self.surf.as_mut().unwrap();
-        if want_h != surf.want_h {
+        if (want_w, want_h) != (surf.want_w, surf.want_h) {
+            surf.want_w = want_w;
             surf.want_h = want_h;
-            surf.layer.set_size(W, want_h);
+            surf.layer.set_size(want_w, want_h);
             surf.layer.commit();
+            self.dirty = true;
+            return;
         }
         let h = surf.h;
-        let (pw, ph) = (W * scale as u32, h * scale as u32);
+        let (pw, ph) = (surf.w * scale as u32, h * scale as u32);
         let Some(mut pix) = Pixmap::new(pw, ph) else { return };
 
         let pill = rounded(1.0 * sf, 1.0 * sf, pw as f32 - 2.0 * sf, ph as f32 - 2.0 * sf, 22.0 * sf);
@@ -266,17 +275,16 @@ impl Ui {
         paint.set_color_rgba8(255, 255, 255, 34);
         pix.stroke_path(&pill, &paint, &Stroke { width: 1.0 * sf, ..Default::default() }, Transform::identity(), None);
 
-        let cy = 30.0 * sf;
+        let cy = if placeholder { ph as f32 / 2.0 } else { 30.0 * sf };
         let t = self.since.elapsed().as_secs_f32();
         match self.mode {
             Mode::Listening => {
                 let n = 7;
                 let recent: Vec<f32> = self.levels.iter().rev().take(n).copied().collect();
                 for (i, lv) in recent.iter().rev().enumerate() {
-                    let wobble = 0.12 + 0.08 * ((t * 7.0 + i as f32 * 0.9).sin() * 0.5 + 0.5);
-                    let bh = ((lv.max(wobble)) * 26.0).max(4.0) * sf;
-                    let x = (22.0 + i as f32 * 5.5) * sf;
-                    paint.set_color_rgba8(255, 98, 88, 255);
+                    let bh = (lv * 26.0).max(2.0) * sf;
+                    let x = pw as f32 / 2.0 + (i as f32 * 5.5 - 18.1) * sf;
+                    paint.set_color_rgba8(240, 238, 245, 255);
                     if let Some(r) = Rect::from_xywh(x, cy - bh / 2.0, 3.2 * sf, bh) {
                         let p = rounded(r.x(), r.y(), r.width(), r.height(), 1.6 * sf);
                         pix.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
@@ -287,7 +295,7 @@ impl Ui {
                 for i in 0..3 {
                     let a = ((t * 5.0 - i as f32 * 0.7).sin() * 0.5 + 0.5) * 200.0 + 55.0;
                     paint.set_color_rgba8(190, 180, 255, a as u8);
-                    if let Some(p) = PathBuilder::from_circle((28.0 + i as f32 * 11.0) * sf, cy, 3.6 * sf) {
+                    if let Some(p) = PathBuilder::from_circle(pw as f32 / 2.0 + (i as f32 - 1.0) * 11.0 * sf, cy, 3.6 * sf) {
                         pix.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
                     }
                 }
@@ -330,22 +338,6 @@ impl Ui {
         let total_h = lines as f32 * LINE_H;
         let ty = ((h as f32 - total_h) / 2.0 * sf) as i32;
         blend_text(&mut pix, &mut buf, &mut self.fonts, &mut self.cache, color, (TEXT_X * sf) as i32, ty);
-
-        let mut chip = Buffer::new(&mut self.fonts, Metrics::new(11.0 * sf, 14.0 * sf));
-        chip.set_size(Some(80.0 * sf), None);
-        chip.set_text(
-            self.label,
-            &Attrs::new().family(Family::Name("Inter")).weight(Weight(600)),
-            Shaping::Advanced,
-            None,
-        );
-        chip.shape_until_scroll(&mut self.fonts, false);
-        let cw = chip.layout_runs().map(|r| r.line_w).fold(0.0, f32::max);
-        let cx = pw as f32 - cw - 22.0 * sf;
-        let chip_rect = rounded(cx - 8.0 * sf, cy - 10.0 * sf, cw + 16.0 * sf, 20.0 * sf, 10.0 * sf);
-        paint.set_color_rgba8(255, 255, 255, 22);
-        pix.fill_path(&chip_rect, &paint, FillRule::Winding, Transform::identity(), None);
-        blend_text(&mut pix, &mut chip, &mut self.fonts, &mut self.cache, Color::rgba(255, 255, 255, 150), cx as i32, (cy - 7.0 * sf) as i32);
 
         let surf = self.surf.as_mut().unwrap();
         let Ok((wbuf, canvas)) = surf.pool.create_buffer(pw as i32, ph as i32, pw as i32 * 4, wl_shm::Format::Argb8888) else {
@@ -446,6 +438,9 @@ impl LayerShellHandler for Ui {
 
     fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface, cfg: LayerSurfaceConfigure, _: u32) {
         if let Some(s) = self.surf.as_mut() {
+            if cfg.new_size.0 > 0 {
+                s.w = cfg.new_size.0;
+            }
             if cfg.new_size.1 > 0 {
                 s.h = cfg.new_size.1;
             }
@@ -472,3 +467,26 @@ impl ProvidesRegistryState for Ui {
 }
 
 smithay_client_toolkit::delegate_dispatch2!(Ui);
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_indicator_is_compact_but_results_have_room() {
+        assert_eq!(overlay_size(Mode::Listening, 3), (96, 40));
+        assert_eq!(overlay_size(Mode::Transcribing, 3), (96, 40));
+        assert_eq!(overlay_size(Mode::Done, 1), (640, 60));
+        assert_eq!(overlay_size(Mode::Error, 3), (640, 108));
+    }
+
+    #[test]
+    fn only_completed_text_and_errors_are_shown() {
+        let provisional = "random unfinished words";
+        assert_eq!(display_content(Mode::Listening, provisional), ("", true));
+        assert_eq!(display_content(Mode::Transcribing, provisional), ("", true));
+        assert_eq!(display_content(Mode::Done, "Finished sentence."), ("Finished sentence.", false));
+        assert_eq!(display_content(Mode::Error, "Check microphone"), ("Check microphone", false));
+    }
+}
