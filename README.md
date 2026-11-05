@@ -6,12 +6,13 @@ It's like Wispr Flow, for Linux, with no account, no cloud and no subscription.
 
 - **Works everywhere.** It types through the system keyboard, so any app that accepts typing works.
 - **Fast and private.** It uses OpenAI's Whisper (large-v3-turbo) through [whisper.cpp](https://github.com/ggml-org/whisper.cpp) on your GPU (Vulkan) or CPU. Audio never leaves your machine.
-- **English and Telugu, picked automatically.** With the optional Telugu model installed, Meta+Space tells Telugu from English by itself and writes Telugu in Telugu script. You can switch Auto to any of Whisper's ~100 languages.
+- **English dictation.** VoiceType transcribes English only, so there is no language detection step to slow it down.
 - **Hands-free stop.** Speak, then pause for 2 seconds and it types. No second key press needed. It starts transcribing as soon as you go quiet, so the text is usually ready when the pause ends.
-- **Live popup.** A small pill near the bottom of the screen shows your words as you speak, a level meter, and a countdown bar while you pause.
-- **Clean audio.** RNNoise removes background noise and hum, and speech detection drops clips with nothing said, so it doesn't type made-up words.
+- **Compact popup.** A small pill near the bottom of the screen shows an audio-reactive waveform while listening, a countdown line while you pause, and animated dots while processing. No status labels; it expands only for finished text or errors.
+- **Clean audio.** A DC filter removes input offset before RNNoise removes background noise and hum, and speech detection drops clips with nothing said, so it doesn't type made-up words.
 - **Your names, spelled right.** Add names and brands (Claude, Anthropic, your colleagues) to a words list and Whisper uses them as a spelling hint. Fix-up rules catch anything it still gets wrong.
-- **Tray icon and history.** Pick the language, microphone and auto-stop time from the tray. Every dictation is saved locally, so you can search it, copy it, or type it again.
+- **Optional text cleanup.** A small local model can fix your grammar or turn your speech into a clear prompt for AI tools. It is off by default, and your original words stay in History.
+- **Tray icon and history.** Pick the microphone and auto-stop time from the tray. Every dictation is saved locally, so you can search it, copy it, or type it again.
 - **Light.** One Rust binary. The background service uses about 155 MB of RAM plus the model in GPU memory.
 
 ## Requirements
@@ -20,7 +21,8 @@ It's like Wispr Flow, for Linux, with no account, no cloud and no subscription.
 - **PipeWire** for audio.
 - **ydotool** for typing, and permission to use `/dev/uinput`. The installer tells you how to set this up if it's missing.
 - Rust (cargo). For GPU speed you also need `glslc` and the Vulkan headers.
-- About 600 MB of disk for the speech model, plus about 1 GB of GPU memory (about 1.7 GB with the Telugu model too), or it runs on the CPU (slower).
+- Optional, for text cleanup: [Ollama](https://ollama.com) and about 2.3 GB more GPU memory.
+- About 600 MB of disk for the speech model, plus about 1 GB of GPU memory, or it runs on the CPU (slower).
 
 ## Install
 
@@ -36,7 +38,7 @@ The installer:
 2. installs it to `~/.local/bin/voicetype`;
 3. downloads the Whisper model to `~/.local/share/voicetype/models`;
 4. sets up the background service (systemd user service);
-5. on KDE, sets the shortcuts **Meta+Space** (dictate) and **Meta+Shift+Space** (Telugu).
+5. on KDE, sets **Meta+Space** for dictation.
 
 On other desktops, bind a shortcut yourself to:
 
@@ -59,20 +61,27 @@ To uninstall, run `./uninstall.sh`. Add `--purge` to also delete the models, his
 2. Press **Meta+Space** and speak.
 3. Pause for 2 seconds. It transcribes and types. You can press Meta+Space again to stop early.
 
-**Tray menu:** start or stop dictation, language (Auto / English / Telugu), microphone, auto-stop after pause (Off, 1, 1.5, 2 or 3 seconds), your last 10 dictations (click to copy), *Type last again*, *Edit words and names…*, and *History…*.
+**Tray menu:** start, stop or cancel dictation, microphone, auto-stop after pause (Off, 1, 1.5, 2 or 3 seconds), text cleanup (Off, Grammar or Prompt), your last 10 dictations (click to copy), *Type last again*, *Edit words and names…*, and *History…*.
 
 **Commands:**
 
 ```bash
-voicetype toggle [auto|en|te]   # start or stop dictation
+voicetype toggle                # start or stop dictation
 voicetype stop                  # stop and type now
 voicetype cancel                # stop and throw the clip away
 voicetype status                # recording / busy / idle
-voicetype mode auto|en|te       # default language for Meta+Space
 voicetype autostop 2            # seconds of silence before it types (0 = off)
+voicetype cleanup off|grammar|prompt   # optional Qwen text cleanup
+voicetype clean prompt "some text"    # try cleanup on text, without dictating
 voicetype history               # open the history window
-voicetype file [auto|en|te] clip.ogg …   # transcribe audio files
+voicetype file clip.ogg …       # transcribe audio files
 ```
+
+In **History…**, edit a transcript before using Copy or Type. These edits are temporary; Refresh or closing the window restores the saved transcript.
+
+The waveform follows raw microphone levels and stays still when there is no signal. Detailed level diagnostics are available in service logs with `VOICETYPE_DEBUG=1`; they are hidden from the normal popup.
+
+If the microphone disconnects or sends no audio for two seconds, recording stops. Any recovered transcript is saved to History for review instead of being typed automatically. PipeWire errors are available in the service log.
 
 Settings are saved in `~/.config/voicetype/settings.json`. History is saved in `~/.local/share/voicetype/history.jsonl`.
 
@@ -96,39 +105,41 @@ cloud code => Claude Code
 mani barshit => Manibarshit
 ```
 
-The live preview skips the hint to stay fast, so a name can look wrong while you speak and then come out right in the typed text. The Telugu model doesn't use the hint either, but fix rules still apply to Telugu.
+## Text cleanup (optional)
 
-## Telugu (optional)
+VoiceType can pass each dictation through a small local model, Qwen 3.5 2B. Pick a mode under **Text cleanup** in the tray:
 
-Whisper's own language detection barely knows Telugu: it usually hears it as Hindi or English. VoiceType works around that with [vasista22/whisper-telugu-medium](https://huggingface.co/vasista22/whisper-telugu-medium), a Whisper model trained on Telugu. To set it up, convert and compress that model once. This needs Python 3, git, cmake and about 6 GB of temporary space:
+- **Off** (the default) types exactly what Whisper heard. Use it for terminal commands and exact wording.
+- **Grammar** makes light fixes. Use it for messages to people.
+- **Prompt** fixes grammar, removes restarts and rewrites your speech as clear sentences. Use it when talking to AI tools.
+
+It needs [Ollama](https://ollama.com) running on this computer and about 2.3 GB more GPU memory:
 
 ```bash
-./scripts/convert-telugu.sh
+ollama pull qwen3.5:2b
+voicetype cleanup prompt
 ```
 
-Once it's installed:
+Text stays on your computer, and a typical clip takes about 0.3 s more on a laptop RTX 3050.
 
-- **Meta+Space (Auto)** sends speech to the Telugu model when it sounds like an Indian language or Whisper isn't sure it's English. Clear English stays on the fast English model.
-- **Meta+Shift+Space** always uses Telugu, which is handy for heavy Telugu–English mixing that Auto reads as English.
+The model is small and sometimes changes what you meant. In a test on 57 real dictations, Grammar changed the meaning or invented details in about 1 clip in 11, and Prompt in about 1 clip in 7. Most Prompt mistakes were on clips that were already garbled or cut off. Grammar removed about half of the "I mean" corrections; Prompt removed nearly all of them. VoiceType never presses Enter, so read the text before you send it.
 
-On an RTX 3050 laptop, English takes about 0.5 s per clip and Telugu about 1–4 s. Telugu text breaks into far more pieces than English, so the model has more to write.
-
-To choose which languages Auto picks between, edit `"languages"` in `~/.config/voicetype/settings.json`. The default is `["en", "te"]`. For example, `["en", "hi"]` gives English and Hindi.
+VoiceType types your original words instead if Ollama isn't running, takes longer than 5 seconds, or returns something suspicious: a reply far longer or shorter than what you said, a changed number of negative words, a request turned into a promise, your "I" turned into "you", or a made-up placeholder. Clips under 4 words are skipped. When cleanup changes a dictation, **History…** shows the original under it.
 
 ## Troubleshooting
 
 - **It types nonsense like "So", "The" or "Thank you", or nothing.** Your microphone is probably too loud or picking up hum. Run `wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 0.2`, or try another mic from the tray. The last clip is saved to `/run/user/$UID/voicetype-last.wav`, so you can listen to what it heard.
 - **Nothing gets typed.** Check that `ydotool type hello` works in a terminal. If it doesn't, ydotoold isn't running or you can't write to `/dev/uinput`. Re-run `./install.sh` and follow its instructions.
 - **Garbage output on a laptop with two GPUs.** VoiceType picks the discrete GPU automatically. To choose a GPU yourself, set `GGML_VK_VISIBLE_DEVICES=<n>` in the service. Device numbers are listed by `vulkaninfo --summary`.
-- **Suddenly slow (several seconds per clip) on a laptop GPU.** Run `nvidia-smi -q -d PERFORMANCE,POWER,CLOCK` while it transcribes. If the GPU sits in P5 with the memory clock far below its maximum, or reports an impossible power draw (hundreds of watts), the laptop's power controller has glitched and the driver is holding the GPU back. A normal reboot won't fix it. Do a cold boot: shut down, unplug the charger, hold the power button for 15–20 seconds, then boot. On one RTX 3050 laptop this took clips from 3.8 s to 0.65 s.
+- **Slow (several seconds per clip) on a laptop GPU.** If the laptop started on battery, the GPU can stay at battery speed even after you plug in. Run `nvidia-smi -q -d PERFORMANCE,POWER,CLOCK` while it transcribes: if the GPU sits in P5 with the memory clock far below its maximum, restart with the charger connected. On a Lenovo LOQ 15IRX9 with an RTX 3050, replugging the charger and locking the memory clock with `nvidia-smi` did not help, but a normal restart on the charger took memory from 810 to 7001 MHz and a 15-second clip from 2.5 s to 0.7 s. If it is still slow, or the GPU reports an impossible power draw (hundreds of watts), do a cold boot: shut down, unplug the charger, hold the power button for 15–20 seconds, plug the charger back in, then boot.
 - **Logs:** `journalctl --user -u voicetype -f` shows each clip's length, how long it took, and the text.
 
 ## How it works
 
 `voicetype daemon` runs as a user service. It holds the Whisper model in memory, draws the popup as a Wayland layer-shell surface (smithay-client-toolkit + tiny-skia + cosmic-text), shows the tray icon (StatusNotifierItem), and listens on a Unix socket for commands. Your shortcut runs `voicetype toggle`, which sends one line to that socket.
 
-Audio comes from `pw-record` at 48 kHz and goes through RNNoise (`nnnoiseless`). It is resampled to 16 kHz and trimmed using RNNoise's speech probability, then sent to whisper.cpp. Live previews use greedy decoding while you speak. When you go quiet, it transcribes the whole clip at full quality, and if you don't start talking again, that result is the one it types. ASCII text is typed with `ydotool type`. Other scripts, such as Telugu, are pasted through the clipboard, and your previous clipboard is restored afterwards.
+Audio comes from `pw-record` at 48 kHz and goes through RNNoise (`nnnoiseless`). It is resampled to 16 kHz and trimmed using RNNoise's speech probability, then sent to whisper.cpp. The popup shows a waveform while you speak, without decoding provisional previews. When you go quiet, it transcribes the whole clip at full quality, and if you don't start talking again, that result is the one it types. ASCII text is typed with `ydotool type`. Text with non-ASCII characters, such as accented names, is pasted through the clipboard, and your previous clipboard is restored afterwards.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). The models have their own licenses: Whisper is MIT, and vasista22/whisper-telugu-medium is Apache-2.0.
+MIT, see [LICENSE](LICENSE). The Whisper model is also MIT.

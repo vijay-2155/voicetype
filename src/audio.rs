@@ -2,7 +2,7 @@ use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use nnnoiseless::DenoiseState;
@@ -15,8 +15,68 @@ const STEP: usize = MIC_RATE / RATE;
 const TAPS: usize = 63;
 const SPEECH: f32 = 0.6;
 
+#[derive(Clone, Copy, Default)]
+pub struct InputLevel {
+    pub rms: f32,
+    pub peak: f32,
+    pub clipped: f32,
+}
+
+impl InputLevel {
+    pub fn measure(samples: &[f32]) -> Self {
+        Self {
+            rms: rms(samples),
+            peak: samples.iter().fold(0.0f32, |peak, s| peak.max(s.abs())),
+            clipped: samples.iter().filter(|s| s.abs() >= 0.999).count() as f32 / samples.len().max(1) as f32,
+        }
+    }
+
+    pub fn description(self) -> String {
+        let db = 20.0 * self.rms.max(0.000001).log10();
+        // shortcut: level thresholds are guidance, calibrate per device if presets are added.
+        let hint = if self.clipped >= 0.01 {
+            "Clipping — lower microphone volume"
+        } else if self.peak < 0.0001 {
+            "No input — check mute or microphone"
+        } else if db < -45.0 {
+            "Low input — move closer if speaking"
+        } else {
+            "Microphone input"
+        };
+        format!("{hint} · {db:.0} dBFS")
+    }
+}
+
+pub struct CaptureHealth {
+    last_data: Instant,
+    ended: bool,
+}
+
+impl CaptureHealth {
+    pub fn failed(&self) -> bool {
+        self.ended || self.last_data.elapsed() > Duration::from_secs(2)
+    }
+}
+
+#[derive(Default)]
+struct DcBlocker {
+    input: f32,
+    output: f32,
+}
+
+impl DcBlocker {
+    fn process(&mut self, sample: f32) -> f32 {
+        // A 20 Hz high-pass at 48 kHz removes DC without cutting speech fundamentals.
+        let output = sample - self.input + 0.9973854 * self.output;
+        self.input = sample;
+        self.output = output;
+        output
+    }
+}
+
 pub struct Cleaner {
     denoise: Box<DenoiseState<'static>>,
+    dc: DcBlocker,
     taps: Vec<f32>,
     pending: Vec<f32>,
     tail: Vec<f32>,
@@ -38,16 +98,16 @@ impl Cleaner {
             .collect();
         let sum: f32 = taps.iter().sum();
         taps.iter_mut().for_each(|t| *t /= sum);
-        Self { denoise: DenoiseState::new(), taps, pending: Vec::new(), tail: vec![0.0; TAPS - 1], audio: Vec::new(), vad: Vec::new() }
+        Self { denoise: DenoiseState::new(), dc: DcBlocker::default(), taps, pending: Vec::new(), tail: vec![0.0; TAPS - 1], audio: Vec::new(), vad: Vec::new() }
     }
 
     pub fn feed(&mut self, input: &[f32]) -> usize {
-        self.pending.extend(input.iter().map(|s| s * 32768.0));
+        self.pending.extend(input.iter().map(|&s| self.dc.process(s) * 32768.0));
         let before = self.audio.len();
         let mut out = [0f32; FRAME];
-        while self.pending.len() >= FRAME {
-            let frame: Vec<f32> = self.pending.drain(..FRAME).collect();
-            let p = self.denoise.process_frame(&mut out, &frame);
+        let processed = self.pending.len() / FRAME * FRAME;
+        for frame in self.pending[..processed].chunks_exact(FRAME) {
+            let p = self.denoise.process_frame(&mut out, frame);
             self.vad.push(p);
             let mut buf = std::mem::take(&mut self.tail);
             buf.extend(out.iter().map(|s| s / 32768.0));
@@ -57,12 +117,13 @@ impl Cleaner {
             }
             self.tail = buf[buf.len() - (TAPS - 1)..].to_vec();
         }
+        self.pending.drain(..processed);
         before
     }
 }
 
 pub fn heard_speech(vad: &[f32]) -> bool {
-    vad.iter().filter(|&&p| p > SPEECH).count() >= 12
+    vad.iter().filter(|&&p| p > SPEECH).take(12).count() == 12
 }
 
 pub fn speech_after(vad: &[f32], from: usize) -> bool {
@@ -100,10 +161,11 @@ pub struct Recorder {
     reader: Option<JoinHandle<()>>,
     pub samples: Arc<Mutex<Vec<f32>>>,
     pub vad: Arc<Mutex<Vec<f32>>>,
+    pub health: Arc<Mutex<CaptureHealth>>,
 }
 
 impl Recorder {
-    pub fn start(mic: Option<&str>, on_level: impl Fn(f32) + Send + 'static) -> Result<Self> {
+    pub fn start(mic: Option<&str>, on_level: impl Fn(InputLevel) + Send + 'static) -> Result<Self> {
         let mut cmd = Command::new("pw-record");
         if let Some(m) = mic {
             cmd.args(["--target", m]);
@@ -111,22 +173,27 @@ impl Recorder {
         let mut child = cmd
             .args(["--raw", "--rate", &MIC_RATE.to_string(), "--channels", "1", "--format", "s16", "--latency", "20ms", "-"])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .context("starting pw-record")?;
         let mut out = child.stdout.take().context("no pw-record stdout")?;
         let samples = Arc::new(Mutex::new(Vec::with_capacity(RATE * 60)));
         let vad = Arc::new(Mutex::new(Vec::new()));
+        let health = Arc::new(Mutex::new(CaptureHealth { last_data: Instant::now(), ended: false }));
+        let reader_health = health.clone();
         let (sink, vad_sink) = (samples.clone(), vad.clone());
         let reader = std::thread::spawn(move || {
             let mut cleaner = Cleaner::new();
             let mut buf = [0u8; 4800];
             let mut carry: Option<u8> = None;
+            let mut levels = Vec::with_capacity(MIC_RATE / 10);
             loop {
                 let n = match out.read(&mut buf) {
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
+                reader_health.lock().unwrap().last_data = Instant::now();
                 let mut bytes = Vec::with_capacity(n + 1);
                 bytes.extend(carry.take());
                 bytes.extend_from_slice(&buf[..n]);
@@ -137,22 +204,29 @@ impl Recorder {
                     .chunks_exact(2)
                     .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
                     .collect();
+                levels.extend_from_slice(&chunk);
+                if levels.len() >= MIC_RATE / 10 {
+                    on_level(InputLevel::measure(&levels));
+                    levels.clear();
+                }
                 let vad_before = cleaner.vad.len();
                 let from = cleaner.feed(&chunk);
                 let fresh = &cleaner.audio[from..];
                 if !fresh.is_empty() {
-                    let speaking = cleaner.vad[vad_before..].iter().any(|&p| p > SPEECH);
-                    on_level(if speaking { rms(fresh).max(0.02) } else { rms(fresh) * 0.3 });
-                    sink.lock().unwrap().extend_from_slice(fresh);
-                    vad_sink.lock().unwrap().extend_from_slice(&cleaner.vad[vad_before..]);
+                    let mut samples = sink.lock().unwrap();
+                    let mut vad = vad_sink.lock().unwrap();
+                    samples.extend_from_slice(fresh);
+                    vad.extend_from_slice(&cleaner.vad[vad_before..]);
                 }
             }
+            reader_health.lock().unwrap().ended = true;
         });
-        Ok(Self { child, reader: Some(reader), samples, vad })
+        Ok(Self { child, reader: Some(reader), samples, vad, health })
     }
 
-    pub fn stop(mut self) -> (Vec<f32>, Vec<f32>) {
+    pub fn stop(mut self) -> (Vec<f32>, Vec<f32>, bool) {
         std::thread::sleep(Duration::from_millis(150));
+        let failed = self.health.lock().unwrap().failed();
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(r) = self.reader.take() {
@@ -160,12 +234,15 @@ impl Recorder {
         }
         let audio = std::mem::take(&mut *self.samples.lock().unwrap());
         let vad = std::mem::take(&mut *self.vad.lock().unwrap());
-        (finish_clip(&audio, &vad), vad)
+        (finish_clip(&audio, &vad), vad, failed)
     }
 
     pub fn cancel(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -205,4 +282,87 @@ pub fn decode_file(path: &str, clean: bool) -> Result<Vec<f32>> {
     let mut c = Cleaner::new();
     c.feed(&raw);
     Ok(finish_clip(&c.audio, &c.vad))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_levels_distinguish_silence_quiet_and_clipping() {
+        assert!(InputLevel::measure(&[]).description().contains("No input"));
+        assert!(InputLevel::measure(&[0.0; 4800]).description().contains("No input"));
+        assert!(InputLevel::measure(&[0.001; 4800]).description().contains("Low input"));
+        let normal = InputLevel::measure(&[0.1, -0.1]);
+        assert!((normal.rms - 0.1).abs() < 0.00001);
+        assert_eq!(normal.clipped, 0.0);
+        assert!(normal.description().contains("-20 dBFS"));
+        let mut samples = vec![0.1; 100];
+        samples[0] = -1.0;
+        assert!(InputLevel::measure(&samples).description().contains("Clipping"));
+        assert_eq!(InputLevel::measure(&samples).peak, 1.0);
+    }
+
+    #[test]
+    fn dc_filter_removes_offset_and_preserves_speech_band() {
+        let mut filter = DcBlocker::default();
+        for _ in 0..MIC_RATE {
+            filter.process(0.25);
+        }
+        assert!(filter.output.abs() < 0.00001);
+        let mut input = Vec::new();
+        let mut output = Vec::new();
+        for i in 0..MIC_RATE {
+            let sample = 0.1 * (2.0 * std::f32::consts::PI * 200.0 * i as f32 / MIC_RATE as f32).sin();
+            let cleaned = filter.process(sample + 0.25);
+            if i > MIC_RATE / 2 {
+                input.push(sample);
+                output.push(cleaned);
+            }
+        }
+        assert!((rms(&output) / rms(&input) - 1.0).abs() < 0.02);
+        assert!(output.iter().sum::<f32>().abs() / (output.len() as f32) < 0.0001);
+    }
+
+    #[test]
+    fn capture_health_detects_ended_and_stalled_streams() {
+        let mut health = CaptureHealth { last_data: Instant::now(), ended: false };
+        assert!(!health.failed());
+        health.ended = true;
+        assert!(health.failed());
+        health.ended = false;
+        health.last_data = Instant::now() - Duration::from_secs(3);
+        assert!(health.failed());
+    }
+
+    #[test]
+    fn cleaning_is_independent_of_input_chunk_size() {
+        let input: Vec<f32> = (0..FRAME * 24 + 17).map(|i| (i as f32 * 0.07).sin() * 0.1).collect();
+        let mut whole = Cleaner::new();
+        whole.feed(&input);
+        let mut chunked = Cleaner::new();
+        for chunk in input.chunks(317) {
+            let before = chunked.audio.len();
+            assert_eq!(chunked.feed(chunk), before);
+        }
+        assert_eq!(whole.audio.len(), 24 * FRAME / STEP);
+        assert_eq!(whole.pending.len(), 17);
+        assert_eq!(whole.audio, chunked.audio);
+        assert_eq!(whole.vad, chunked.vad);
+        assert_eq!(whole.pending, chunked.pending);
+    }
+
+    #[test]
+    fn speech_gate_and_trim_keep_the_trailing_margin() {
+        assert!(!heard_speech(&[0.9; 11]));
+        assert!(heard_speech(&[0.9; 12]));
+        let mut vad = vec![0.0; 100];
+        vad[35..47].fill(0.9);
+        let audio = vec![0.1; vad.len() * FRAME / STEP];
+        let clip = finish_clip(&audio, &vad);
+        assert_eq!(clip.len(), (46 + 45 - (35 - 30)) * FRAME / STEP);
+        assert!(!speech_after(&vad, 47));
+        assert!(speech_after(&vad, 46));
+        assert!(finish_clip(&audio, &[0.0; 100]).is_empty());
+    }
 }

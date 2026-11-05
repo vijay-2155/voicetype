@@ -1,4 +1,5 @@
 mod audio;
+mod cleanup;
 mod engine;
 mod history;
 mod output;
@@ -16,7 +17,7 @@ use anyhow::{Context, Result};
 use smithay_client_toolkit::reexports::calloop::channel;
 
 use audio::Recorder;
-use engine::{Engine, Profile, RATE};
+use engine::{Engine, RATE};
 use overlay::UiMsg;
 use tray::{State, VoiceTray};
 
@@ -36,14 +37,14 @@ fn sock_path() -> PathBuf {
     runtime_dir().join("voicetype.sock")
 }
 
-type Spec = Arc<Mutex<Option<(usize, String)>>>;
+type Spec = Arc<Mutex<Option<(usize, String, String)>>>;
 
 struct Session {
     id: u64,
     rec: Recorder,
-    profile: Profile,
     stop: Arc<AtomicBool>,
     spec: Spec,
+    cleanup: cleanup::Mode,
 }
 
 struct Ctl {
@@ -61,14 +62,13 @@ impl Ctl {
         let mut parts = line.split_whitespace();
         match parts.next().unwrap_or("") {
             "toggle" => {
-                let profile = parts.next().and_then(Profile::parse).unwrap_or_else(|| self.profile());
                 if self.session.is_some() {
                     self.finish();
                     "stopped".into()
                 } else if self.busy.load(Ordering::SeqCst) {
                     "busy".into()
                 } else {
-                    match self.start(profile) {
+                    match self.start() {
                         Ok(()) => "recording".into(),
                         Err(e) => {
                             let _ = self.ui.send(UiMsg::Error(format!("Mic failed: {e}")));
@@ -113,14 +113,17 @@ impl Ctl {
                 }
                 None => "usage: autostop <seconds> (0 = off)".into(),
             },
-            "mode" => match parts.next().and_then(Profile::parse) {
-                Some(p) => {
-                    self.settings.profile = p.name().into();
+            "cleanup" => match parts.next().and_then(cleanup::Mode::parse) {
+                Some(mode) => {
+                    self.settings.cleanup = mode;
                     self.settings.save();
-                    set_tray(&self.tray, |t| t.profile = p);
-                    format!("mode {}", p.name())
+                    set_tray(&self.tray, |t| t.cleanup = mode);
+                    if mode != cleanup::Mode::Off {
+                        std::thread::spawn(cleanup::warm);
+                    }
+                    format!("cleanup {}", mode.name())
                 }
-                None => "usage: mode auto|en|te".into(),
+                None => "usage: cleanup off|grammar|prompt".into(),
             },
             "mic" => {
                 let mic = parts.next().filter(|m| *m != "default").map(str::to_string);
@@ -148,33 +151,31 @@ impl Ctl {
         }
     }
 
-    fn profile(&self) -> Profile {
-        Profile::parse(&self.settings.profile).unwrap_or(Profile::Auto)
-    }
-
-    fn start(&mut self, profile: Profile) -> Result<()> {
+    fn start(&mut self) -> Result<()> {
         let ui = self.ui.clone();
         let rec = Recorder::start(self.settings.mic.as_deref(), move |l| {
             let _ = ui.send(UiMsg::Level(l));
         })?;
-        let _ = self.ui.send(UiMsg::Listening(profile.label()));
+        let _ = self.ui.send(UiMsg::Listening);
+        let tidy = self.settings.cleanup;
+        if tidy != cleanup::Mode::Off {
+            std::thread::spawn(cleanup::warm);
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let samples = rec.samples.clone();
         let vad = rec.vad.clone();
         let engine = self.engine.clone();
-        let ui = self.ui.clone();
         self.next_id += 1;
         let id = self.next_id;
         {
             let (vad, ui, flag, wait) = (rec.vad.clone(), self.ui.clone(), stop.clone(), self.settings.auto_stop);
-            std::thread::spawn(move || watch_pause(id, wait, &vad, &ui, &flag));
+            let health = rec.health.clone();
+            std::thread::spawn(move || watch_pause(id, wait, &vad, &ui, &flag, &health));
         }
         let spec: Spec = Arc::new(Mutex::new(None));
         let flag = stop.clone();
         let spec_w = spec.clone();
         std::thread::spawn(move || {
-            let mut last = 0;
-            let mut last_run = Instant::now() - Duration::from_secs(1);
             while !flag.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(100));
                 let (heard, quiet, vlen) = {
@@ -185,7 +186,7 @@ impl Ctl {
                     continue;
                 }
                 if quiet >= SPEC_AFTER {
-                    let fresh = spec_w.lock().unwrap().as_ref().is_none_or(|(l, _)| *l < vlen.saturating_sub((quiet * 100.0) as usize));
+                    let fresh = spec_w.lock().unwrap().as_ref().is_none_or(|(l, ..)| *l < vlen.saturating_sub((quiet * 100.0) as usize));
                     if !fresh {
                         continue;
                     }
@@ -194,38 +195,18 @@ impl Ctl {
                         let v = vad.lock().unwrap();
                         (audio::finish_clip(&s, &v), v.len())
                     };
+                    // Hold the engine until the result is stored, so finish() waits and can use it.
                     let mut eng = engine.lock().unwrap();
-                    if let Ok(text) = eng.transcribe(profile, &clip, false, None) {
-                        if !flag.load(Ordering::SeqCst) && !text.is_empty() {
-                            let _ = ui.send(UiMsg::Partial(text.clone()));
-                        }
-                        *spec_w.lock().unwrap() = Some((l, text));
-                    }
-                    continue;
-                }
-                if last_run.elapsed() < Duration::from_millis(500) {
-                    continue;
-                }
-                let snap = {
-                    let s = samples.lock().unwrap();
-                    if s.len() < RATE * 3 / 4 || s.len() - last < RATE / 3 {
-                        continue;
-                    }
-                    last = s.len();
-                    s[s.len().saturating_sub(RATE * 25)..].to_vec()
-                };
-                let Ok(mut eng) = engine.try_lock() else { continue };
-                last_run = Instant::now();
-                if let Ok(text) = eng.transcribe(profile, &snap, true, Some(&flag)) {
-                    if !flag.load(Ordering::SeqCst) && !text.is_empty() {
-                        let _ = ui.send(UiMsg::Partial(text));
+                    if let Ok(raw) = eng.transcribe(&clip) {
+                        let text = cleanup::apply(tidy, &raw);
+                        *spec_w.lock().unwrap() = Some((l, raw, text));
                     }
                 }
             }
         });
-        self.session = Some(Session { id, rec, profile, stop, spec });
-        set_tray(&self.tray, |t| t.state = State::Recording(profile));
-        eprintln!("recording [{}]", profile.label());
+        self.session = Some(Session { id, rec, stop, spec, cleanup: tidy });
+        set_tray(&self.tray, |t| t.state = State::Recording);
+        eprintln!("recording");
         Ok(())
     }
 
@@ -241,27 +222,42 @@ impl Ctl {
         let busy = self.busy.clone();
         std::thread::spawn(move || {
             let t = Instant::now();
-            let (audio, vad) = s.rec.stop();
+            let (audio, vad, capture_failed) = s.rec.stop();
             let _ = audio::write_wav(&runtime_dir().join("voicetype-last.wav"), &audio);
             let result = if audio.is_empty() {
-                Ok(String::new())
+                Ok((String::new(), String::new()))
             } else {
                 let mut eng = engine.lock().unwrap();
-                let early = s.spec.lock().unwrap().take().filter(|(l, _)| !audio::speech_after(&vad, *l));
+                let early = s.spec.lock().unwrap().take().filter(|(l, ..)| !audio::speech_after(&vad, *l));
                 match early {
-                    Some((_, text)) => {
+                    Some((_, raw, text)) => {
                         eprintln!("used the transcript made during the pause");
-                        Ok(text)
+                        Ok((raw, text))
                     }
-                    None => eng.transcribe(s.profile, &audio, false, None),
+                    None => eng.transcribe(&audio).map(|raw| {
+                        let text = cleanup::apply(s.cleanup, &raw);
+                        (raw, text)
+                    }),
                 }
             };
             match result {
-                Ok(text) if !text.is_empty() => {
+                Ok((raw, text)) if !text.is_empty() => {
                     eprintln!("{:.1}s audio -> {:.2}s: {text}", audio.len() as f32 / RATE as f32, t.elapsed().as_secs_f32());
-                    let _ = ui.send(UiMsg::Done(text.clone()));
-                    output::type_text(&format!("{text} "));
-                    history::append(s.profile.name(), audio.len() as f32 / RATE as f32, &text);
+                    let saved = history::append(audio.len() as f32 / RATE as f32, &text, &raw);
+                    if let Err(e) = &saved {
+                        eprintln!("could not save history: {e}");
+                    }
+                    if capture_failed {
+                        let message = if saved.is_ok() {
+                            "Microphone stopped. Captured text saved in History — check your mic."
+                        } else {
+                            "Microphone stopped; history could not be saved. Copy captured text from the tray’s Recent menu."
+                        };
+                        let _ = ui.send(UiMsg::Error(message.into()));
+                    } else {
+                        let _ = ui.send(UiMsg::Done(text.clone()));
+                        output::type_text(&format!("{text} "));
+                    }
                     set_tray(&tray, |t| {
                         t.recent.push(text.clone());
                         if t.recent.len() > 10 {
@@ -271,7 +267,7 @@ impl Ctl {
                 }
                 Ok(_) => {
                     eprintln!("{:.1}s audio -> nothing heard", audio.len() as f32 / RATE as f32);
-                    let _ = ui.send(UiMsg::Error("Didn't catch that — try again".into()));
+                    let _ = ui.send(UiMsg::Error(if capture_failed { "Microphone stopped — check its connection and select it in the tray" } else { "No speech detected — check mute, move closer, or choose another microphone" }.into()));
                 }
                 Err(e) => {
                     eprintln!("transcribe failed: {e:#}");
@@ -285,14 +281,22 @@ impl Ctl {
 }
 
 const GRACE: f32 = 0.5;
-const SPEC_AFTER: f32 = 0.35;
+// Wait for finish_clip's 450 ms trailing margin before caching the final words.
+const SPEC_AFTER: f32 = 0.5;
 const NO_SPEECH_LIMIT: Duration = Duration::from_secs(10);
 
-fn watch_pause(id: u64, wait: f32, vad: &Mutex<Vec<f32>>, ui: &channel::Sender<UiMsg>, flag: &AtomicBool) {
+fn watch_pause(id: u64, wait: f32, vad: &Mutex<Vec<f32>>, ui: &channel::Sender<UiMsg>, flag: &AtomicBool, health: &Mutex<audio::CaptureHealth>) {
     let began = Instant::now();
     let mut shown = 0.0f32;
     while !flag.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(50));
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        if health.lock().unwrap().failed() {
+            send(&format!("stop {id}"));
+            return;
+        }
         let (heard, quiet) = {
             let v = vad.lock().unwrap();
             (audio::heard_speech(&v), audio::trailing_silence(&v))
@@ -320,21 +324,12 @@ fn watch_pause(id: u64, wait: f32, vad: &Mutex<Vec<f32>>, ui: &channel::Sender<U
 }
 
 fn daemon() -> Result<()> {
-    let engine = Arc::new(Mutex::new({
-        let mut e = Engine::new();
-        e.auto_languages = history::Settings::load().languages;
-        e
-    }));
+    let engine = Arc::new(Mutex::new(Engine::new()));
     {
         let engine = engine.clone();
         std::thread::spawn(move || {
-            if let Err(e) = engine.lock().unwrap().preload(Profile::Auto) {
+            if let Err(e) = engine.lock().unwrap().preload() {
                 eprintln!("preload failed: {e:#}");
-            }
-            if engine.lock().unwrap().auto_languages.iter().any(|l| l == "te") {
-                if let Err(e) = engine.lock().unwrap().preload(Profile::Te) {
-                    eprintln!("telugu preload skipped: {e:#}");
-                }
             }
         });
     }
@@ -345,11 +340,11 @@ fn daemon() -> Result<()> {
         use ksni::blocking::TrayMethods;
         let t = VoiceTray {
             state: State::Idle,
-            profile: Profile::parse(&settings.profile).unwrap_or(Profile::Auto),
             mic: settings.mic.clone(),
             mics: tray::list_mics(),
             recent,
             auto_stop: settings.auto_stop,
+            cleanup: settings.cleanup,
         };
         match t.spawn() {
             Ok(h) => Some(h),
@@ -408,16 +403,11 @@ fn client(args: &[String]) -> Result<()> {
 }
 
 fn files(args: &[String]) -> Result<()> {
-    let (profile, rest) = match args.first().and_then(|a| Profile::parse(a)) {
-        Some(p) => (p, &args[1..]),
-        None => (Profile::Auto, args),
-    };
     let mut engine = Engine::new();
-    engine.auto_languages = history::Settings::load().languages;
-    for f in rest {
+    for f in args {
         let audio = audio::decode_file(f, std::env::var_os("VOICETYPE_RAW").is_none())?;
         let t = Instant::now();
-        let text = engine.transcribe(profile, &audio, false, None)?;
+        let text = engine.transcribe(&audio)?;
         eprintln!("-- {f} ({:.1}s audio, {:.2}s)", audio.len() as f32 / RATE as f32, t.elapsed().as_secs_f32());
         println!("{text}");
     }
@@ -430,6 +420,14 @@ fn main() -> Result<()> {
         Some("daemon") => daemon(),
         Some("file") => files(&args[1..]),
         Some("history") => history::window(),
+        Some("clean") => match args.get(1).and_then(|m| cleanup::Mode::parse(m)) {
+            Some(mode) => {
+                cleanup::warm();
+                println!("{}", cleanup::apply(mode, &args[2..].join(" ")));
+                Ok(())
+            }
+            None => anyhow::bail!("usage: voicetype clean grammar|prompt \"some text\""),
+        },
         _ => client(&args),
     }
 }
